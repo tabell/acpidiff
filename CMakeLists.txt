@@ -37,11 +37,16 @@ else()
     message(FATAL_ERROR "ACPICA headers not found at ${ACPICA_ROOT}/source/include. Set ACPICA_ROOT.")
   endif()
 
-  # Source files: core + Unix service layer
+  # Source files: core + minimal Unix service layer
   file(GLOB_RECURSE ACPICA_CORE
        "${ACPICA_ROOT}/source/components/*.c")
-  file(GLOB ACPICA_OSL
-       "${ACPICA_ROOT}/source/os_specific/service_layers/*.c")
+  list(FILTER ACPICA_CORE EXCLUDE REGEX "/components/debugger/")
+  list(FILTER ACPICA_CORE EXCLUDE REGEX "/components/disassembler/")
+  list(FILTER ACPICA_CORE EXCLUDE REGEX "/components/resources/rsdump.c$")
+
+  set(ACPICA_OSL
+      "${ACPICA_ROOT}/source/os_specific/service_layers/osunixxf.c"
+  )
 
   add_library(acpica_vendor STATIC ${ACPICA_CORE} ${ACPICA_OSL})
   set_target_properties(acpica_vendor PROPERTIES
@@ -63,7 +68,7 @@ else()
       ACPI_USE_NATIVE_MATH64
       ACPI_USE_NATIVE_MEMORY_ALLOCATION
       ACPI_USE_NATIVE_ALLOCATE_ZERO_MEMORY
-      ACPI_LIBRARY            # build as a library (no tools' mains)
+      ACPI_APPLICATION        # enable userland/application globals
   )
 
   if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
