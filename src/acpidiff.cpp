@@ -2,9 +2,6 @@
 // C++17 ACPICA namespace builder and diff tool
 // Parse-only. No interpreter execution.
 
-#include <acpi.h>
-#include <accommon.h>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -27,6 +24,15 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+extern "C" {
+#include <acpi.h>
+#include <accommon.h>
+}
+
+#ifdef __init
+#undef __init
+#endif
 
 #ifdef USE_ACPICA_INTERNALS
 // Prefer internal visibility for AML length and table ownership mapping
@@ -106,8 +112,18 @@ static Kind mapTypeToKind(ACPI_OBJECT_TYPE t){
     case ACPI_TYPE_BUFFER: return Kind::Buffer;
     case ACPI_TYPE_REGION: return Kind::Region;
     case ACPI_TYPE_FIELD_UNIT: return Kind::Field;
+#ifdef ACPI_TYPE_INDEX_FIELD
     case ACPI_TYPE_INDEX_FIELD: return Kind::IndexField;
+#endif
+#ifdef ACPI_TYPE_LOCAL_INDEX_FIELD
+    case ACPI_TYPE_LOCAL_INDEX_FIELD: return Kind::IndexField;
+#endif
+#ifdef ACPI_TYPE_BANK_FIELD
     case ACPI_TYPE_BANK_FIELD: return Kind::BankField;
+#endif
+#ifdef ACPI_TYPE_LOCAL_BANK_FIELD
+    case ACPI_TYPE_LOCAL_BANK_FIELD: return Kind::BankField;
+#endif
     case ACPI_TYPE_LOCAL_SCOPE: return Kind::Scope;
     case ACPI_TYPE_PROCESSOR: return Kind::Processor;
     case ACPI_TYPE_THERMAL: return Kind::ThermalZone;
@@ -150,7 +166,9 @@ static std::vector<std::string> expandGlobs(const std::vector<std::string>& inpu
         while(std::isdigit(*pb)){vb=vb*10+(*pb-'0'); pb++;}
         if(va!=vb) return va<vb;
       } else {
-        if(*pa!=*pb) return *pa<*pb; pa++; pb++;
+        if(*pa!=*pb) return *pa<*pb;
+        pa++;
+        pb++;
       }
     }
     return std::strlen(pa)<std::strlen(pb);
@@ -177,7 +195,7 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
     if(hdr->Length != buf.size()){
       std::cerr << "warn: table length mismatch for "<<p<<" hdr="<<hdr->Length<<" bytes file="<<buf.size()<<"\n";
     }
-    ACPI_STATUS s = AcpiLoadTable(hdr);
+    ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
     if(ACPI_FAILURE(s)){
       std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<std::hex<<s;
       throw std::runtime_error(oss.str());
@@ -231,6 +249,9 @@ static ACPI_STATUS walkCb(ACPI_HANDLE Object, UINT32 /*NestingLevel*/, void* Ctx
 
   ACPI_OBJECT_TYPE t; s = AcpiGetType(Object, &t); if(ACPI_FAILURE(s)) t = ACPI_TYPE_ANY;
   ACPI_DEVICE_INFO *info=nullptr; s = AcpiGetObjectInfo(Object, &info);
+#ifdef USE_ACPICA_INTERNALS
+  auto *ns_node = reinterpret_cast<acpi_namespace_node*>(Object);
+#endif
 
   auto n = std::make_unique<Node>();
   n->path = path;
@@ -242,20 +263,20 @@ static ACPI_STATUS walkCb(ACPI_HANDLE Object, UINT32 /*NestingLevel*/, void* Ctx
       n->attrs.arg_count = info->ParamCount;
       n->attrs.serialized = (info->Flags & ACPI_METHOD_SERIALIZED) != 0;
     }
-#ifdef USE_ACPICA_INTERNALS
-    auto it = ctx.owner_to_table.find(info->OwnerId);
-    if(it!=ctx.owner_to_table.end()) n->table_id = it->second;
-#endif
     AcpiOsFree(info);
   }
 
 #ifdef USE_ACPICA_INTERNALS
-  if(n->kind == Kind::Method){
-    auto node = reinterpret_cast<acpi_namespace_node*>(Object);
-    if(node && node->Object && node->Object->Common.Type==ACPI_TYPE_METHOD){
-      auto &m = node->Object->Method;
+  if(ns_node){
+    auto it = ctx.owner_to_table.find(ns_node->OwnerId);
+    if(it!=ctx.owner_to_table.end()) n->table_id = it->second;
+  }
+
+  if(n->kind == Kind::Method && ns_node){
+    if(ns_node->Object && ns_node->Object->Common.Type==ACPI_TYPE_METHOD){
+      auto &m = ns_node->Object->Method;
       n->attrs.aml_len = m.AmlLength;
-      if(m.Aml && m.AmlLength){ n->attrs.aml_sha256 = sha256(m.Aml, m.AmlLength); }
+      if(m.AmlStart && m.AmlLength){ n->attrs.aml_sha256 = sha256(m.AmlStart, m.AmlLength); }
     }
   }
 #endif
