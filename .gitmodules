@@ -1,0 +1,3 @@
+[submodule "vendor/acpica"]
+	path = vendor/acpica
+	url = git@github.com:acpica/acpica.git
