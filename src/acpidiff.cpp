@@ -218,7 +218,12 @@ struct AcpiGuard {
     vlog("Initializing ACPICA tables (32 entries, allow resize)");
     s = AcpiInitializeTables(nullptr, 32, TRUE);
     vlogStatus("AcpiInitializeTables returned", s);
-    if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiInitializeTables failed");
+    if(s == AE_NOT_FOUND){
+      // Expected when operating without firmware access; tables will be provided manually.
+      vlog("AcpiInitializeTables reported AE_NOT_FOUND; continuing with manual tables");
+    } else if(ACPI_FAILURE(s)){
+      throw std::runtime_error("AcpiInitializeTables failed");
+    }
     vlog("ACPICA initialization complete");
   }
   ~AcpiGuard(){
