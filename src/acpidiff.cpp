@@ -29,6 +29,7 @@
 extern "C" {
 #include <acpi.h>
 #include <accommon.h>
+#include <actbl.h>
 }
 
 #ifdef __init
@@ -140,29 +141,13 @@ static void recordExtraTableDigest(const std::string &signature,
   gExtraTableDigests.push_back(std::move(entry));
 }
 
-static bool tableContainsAml(const ACPI_TABLE_HEADER *hdr, size_t blobSize){
+static bool tableContainsAml(const ACPI_TABLE_HEADER *hdr){
   if(!hdr) return false;
-  std::string sig(hdr->Signature, hdr->Signature + ACPI_NAMESEG_SIZE);
-  if(sig == "DSDT" || sig == "SSDT" || sig == "PSDT" || sig == "OSDT"){
-    return true;
-  }
-  if(sig.rfind("OEM", 0) == 0){
-    return true;
-  }
-  size_t headerSize = sizeof(ACPI_TABLE_HEADER);
-  if(blobSize < headerSize || hdr->Length <= headerSize){
-    return false;
-  }
-  const uint8_t *aml = reinterpret_cast<const uint8_t*>(hdr) + headerSize;
-  size_t amlLen = std::min(static_cast<size_t>(hdr->Length - headerSize),
-                           blobSize - headerSize);
-  if(amlLen == 0){
-    return false;
-  }
-  // AML definition blocks start with the DefBlock opcode (0x10). If the first
-  // opcode looks like a DefinitionBlock, treat the table as executable AML even
-  // if the signature is non-standard.
-  if(aml[0] == 0x10){
+  if(ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_DSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_SSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_PSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_OSDT) ||
+     ACPI_IS_OEM_SIG(hdr->Signature)){
     return true;
   }
   return false;
@@ -397,7 +382,7 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           <<" bytes file="<<buf.size();
       logWarn(oss.str());
     }
-    bool hasAml = tableContainsAml(hdr, buf.size());
+    bool hasAml = tableContainsAml(hdr);
     if(isInfoEnabled()){
       std::ostringstream oss;
       oss << (hasAml ? "Loading" : "Recording non-AML")
