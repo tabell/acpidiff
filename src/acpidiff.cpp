@@ -138,11 +138,32 @@ static Kind mapTypeToKind(ACPI_OBJECT_TYPE t){
 
 // ---------------- Utility ----------------
 
-static bool gVerbose = false;
+enum class LogSeverity { Info, Warning, Error };
 
-static void vlog(const std::string &msg){
-  if(gVerbose) std::cerr << "info: " << msg << "\n";
+static LogSeverity gLogThreshold = LogSeverity::Error;
+
+static bool isSeverityEnabled(LogSeverity severity){
+  return static_cast<int>(severity) >= static_cast<int>(gLogThreshold);
 }
+
+static bool isInfoEnabled(){
+  return isSeverityEnabled(LogSeverity::Info);
+}
+
+static void logMessage(LogSeverity severity, const std::string &msg){
+  if(!isSeverityEnabled(severity)) return;
+  const char* label = nullptr;
+  switch(severity){
+    case LogSeverity::Info: label = "info"; break;
+    case LogSeverity::Warning: label = "warn"; break;
+    case LogSeverity::Error: label = "error"; break;
+  }
+  std::cerr << label << ": " << msg << "\n";
+}
+
+static void logInfo(const std::string &msg){ logMessage(LogSeverity::Info, msg); }
+static void logWarn(const std::string &msg){ logMessage(LogSeverity::Warning, msg); }
+static void logError(const std::string &msg){ logMessage(LogSeverity::Error, msg); }
 
 static std::string formatStatus(ACPI_STATUS s){
   std::ostringstream oss;
@@ -153,12 +174,51 @@ static std::string formatStatus(ACPI_STATUS s){
   return oss.str();
 }
 
-static void vlogStatus(const std::string &context, ACPI_STATUS s){
-  if(gVerbose) std::cerr << "info: " << context << ": " << formatStatus(s) << "\n";
+static void logStatus(const std::string &context, ACPI_STATUS s,
+                      LogSeverity failureSeverity = LogSeverity::Error,
+                      LogSeverity successSeverity = LogSeverity::Info){
+  std::ostringstream oss;
+  oss << context << ": " << formatStatus(s);
+  logMessage(ACPI_FAILURE(s) ? failureSeverity : successSeverity, oss.str());
+}
+
+static std::string acpiNameToString(ACPI_NAME name){
+  if(!name) return "<root>";
+  char text[5];
+  for(int i=0;i<4;i++){
+    unsigned shift = 24 - static_cast<unsigned>(i)*8;
+    unsigned char ch = static_cast<unsigned char>((name >> shift) & 0xFF);
+    if(ch == 0 || !std::isprint(ch)) ch = '_';
+    text[i] = static_cast<char>(ch);
+  }
+  text[4] = '\0';
+  return std::string(text);
+}
+
+static ACPI_STATUS acpiExceptionHandler(ACPI_STATUS status, ACPI_NAME name,
+                                        UINT16 opcode, UINT32 amlOffset,
+                                        void* /*context*/){
+  LogSeverity severity = LogSeverity::Error;
+  if(status == AE_NO_HANDLER){
+    severity = LogSeverity::Warning;
+  }
+  std::ostringstream oss;
+  oss << "ACPICA exception " << formatStatus(status);
+  if(name){
+    oss << " in [" << acpiNameToString(name) << ']';
+  }
+  oss << " opcode=0x" << std::hex << opcode << " aml_offset=0x" << amlOffset;
+  if(status == AE_NO_HANDLER){
+    oss << " (no region handler installed; expected without firmware access)";
+  } else if(status == AE_NOT_FOUND){
+    oss << " (namespace lookup failure; tables may be incomplete)";
+  }
+  logMessage(severity, oss.str());
+  return status;
 }
 
 static std::vector<uint8_t> readFile(const std::string &path){
-  vlog(std::string("Reading table file ") + path);
+  logInfo(std::string("Reading table file ") + path);
   std::ifstream f(path, std::ios::binary);
   if(!f) throw std::runtime_error("Failed to open file: "+path);
   f.seekg(0, std::ios::end);
@@ -167,14 +227,14 @@ static std::vector<uint8_t> readFile(const std::string &path){
   f.seekg(0);
   std::vector<uint8_t> buf((size_t)n);
   if(!f.read((char*)buf.data(), n)) throw std::runtime_error("Failed to read: "+path);
-  vlog(std::string("Read ") + std::to_string(buf.size()) + " bytes from " + path);
+  logInfo(std::string("Read ") + std::to_string(buf.size()) + " bytes from " + path);
   return buf;
 }
 
 static std::vector<std::string> expandGlobs(const std::vector<std::string>& inputs){
   std::vector<std::string> out;
   for(const auto &pat: inputs){
-    vlog(std::string("Expanding pattern ") + pat);
+    logInfo(std::string("Expanding pattern ") + pat);
     glob_t g{}; int r = glob(pat.c_str(), 0, nullptr, &g);
     if(r==0){ for(size_t i=0;i<g.gl_pathc;i++) out.emplace_back(g.gl_pathv[i]); }
     else { out.push_back(pat); }
@@ -197,11 +257,11 @@ static std::vector<std::string> expandGlobs(const std::vector<std::string>& inpu
     return std::strlen(pa)<std::strlen(pb);
   };
   std::sort(out.begin(), out.end(), natcmp);
-  if(gVerbose){
+  if(isInfoEnabled()){
     std::ostringstream oss;
     oss << "Expanded inputs to " << out.size() << " file(s):";
     for(const auto &p : out) oss << "\n  " << p;
-    vlog(oss.str());
+    logInfo(oss.str());
   }
   return out;
 }
@@ -211,31 +271,43 @@ static std::vector<std::string> expandGlobs(const std::vector<std::string>& inpu
 struct AcpiGuard {
   AcpiGuard(){
     ACPI_STATUS s;
-    vlog("Initializing ACPICA subsystem");
+    logInfo("Initializing ACPICA subsystem");
     s = AcpiInitializeSubsystem();
-    vlogStatus("AcpiInitializeSubsystem returned", s);
+    logStatus("AcpiInitializeSubsystem returned", s);
     if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiInitializeSubsystem failed");
-    vlog("Initializing ACPICA tables (32 entries, allow resize)");
+    logInfo("Installing ACPICA exception handler");
+    s = AcpiInstallExceptionHandler(&acpiExceptionHandler);
+    logStatus("AcpiInstallExceptionHandler returned", s);
+    if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiInstallExceptionHandler failed");
+    logInfo("Initializing ACPICA tables (32 entries, allow resize)");
     s = AcpiInitializeTables(nullptr, 32, TRUE);
-    vlogStatus("AcpiInitializeTables returned", s);
-    if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiInitializeTables failed");
-    vlog("ACPICA initialization complete");
+    logStatus("AcpiInitializeTables returned", s, LogSeverity::Warning);
+    if(s == AE_NOT_FOUND){
+      // Expected when operating without firmware access; tables will be provided manually.
+      logWarn("AcpiInitializeTables reported AE_NOT_FOUND; continuing with manual tables");
+    } else if(ACPI_FAILURE(s)){
+      throw std::runtime_error("AcpiInitializeTables failed");
+    }
+    logInfo("ACPICA initialization complete");
   }
   ~AcpiGuard(){
-    vlog("Terminating ACPICA subsystem");
+    logInfo("Terminating ACPICA subsystem");
     AcpiTerminate();
   }
 };
 
 static void loadTablesFromFiles(const std::vector<std::string>& files){
-  vlog(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
+  logInfo(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
   for(const auto &p : files){
     auto buf = readFile(p);
     auto *hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(buf.data());
     if(hdr->Length != buf.size()){
-      std::cerr << "warn: table length mismatch for "<<p<<" hdr="<<hdr->Length<<" bytes file="<<buf.size()<<"\n";
+      std::ostringstream oss;
+      oss << "table length mismatch for "<<p<<" hdr="<<hdr->Length
+          <<" bytes file="<<buf.size();
+      logWarn(oss.str());
     }
-    if(gVerbose){
+    if(isInfoEnabled()){
       std::ostringstream oss;
       oss << "Loading table signature="
           << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
@@ -252,19 +324,19 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           << std::dec << std::noshowbase
           << " compiler_id="
           << std::string(hdr->AslCompilerId, hdr->AslCompilerId + sizeof(hdr->AslCompilerId));
-      vlog(oss.str());
+      logInfo(oss.str());
     }
     ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
     if(ACPI_FAILURE(s)){
       std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<formatStatus(s);
       throw std::runtime_error(oss.str());
     }
-    vlogStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
+    logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
     static std::vector<std::vector<uint8_t>> _keep; _keep.emplace_back(std::move(buf));
   }
-  vlog("Committing loaded tables to namespace");
+  logInfo("Committing loaded tables to namespace");
   ACPI_STATUS s = AcpiLoadTables();
-  vlogStatus("AcpiLoadTables returned", s);
+  logStatus("AcpiLoadTables returned", s);
   if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
 }
 
@@ -307,16 +379,16 @@ static ACPI_STATUS walkCb(ACPI_HANDLE Object, UINT32 /*NestingLevel*/, void* Ctx
   ACPI_BUFFER buf{ ACPI_ALLOCATE_BUFFER, nullptr };
   ACPI_STATUS s = AcpiGetName(Object, ACPI_FULL_PATHNAME, &buf);
   if(ACPI_FAILURE(s)){
-    vlogStatus("AcpiGetName failed", s);
+    logStatus("AcpiGetName failed", s, LogSeverity::Warning);
     return AE_OK;
   }
   std::string path((char*)buf.Pointer); AcpiOsFree(buf.Pointer);
 
   ACPI_OBJECT_TYPE t; s = AcpiGetType(Object, &t); if(ACPI_FAILURE(s)) t = ACPI_TYPE_ANY;
-  vlogStatus(std::string("AcpiGetType for ") + path, s);
+  logStatus(std::string("AcpiGetType for ") + path, s, LogSeverity::Warning);
   ACPI_DEVICE_INFO *info=nullptr; s = AcpiGetObjectInfo(Object, &info);
-  if(ACPI_FAILURE(s)) vlogStatus(std::string("AcpiGetObjectInfo failed for ") + path, s);
-  else vlogStatus(std::string("AcpiGetObjectInfo returned for ") + path, s);
+  if(ACPI_FAILURE(s)) logStatus(std::string("AcpiGetObjectInfo failed for ") + path, s, LogSeverity::Warning);
+  else logStatus(std::string("AcpiGetObjectInfo returned for ") + path, s);
 #ifdef USE_ACPICA_INTERNALS
   auto *ns_node = reinterpret_cast<acpi_namespace_node*>(Object);
 #endif
@@ -376,19 +448,19 @@ static void computeHashes(Node* n){
 }
 
 static Snapshot buildSnapshot(){
-  vlog("Building ACPI namespace snapshot");
+  logInfo("Building ACPI namespace snapshot");
   BuildCtx ctx;
 #ifdef USE_ACPICA_INTERNALS
   buildOwnerMap(ctx);
 #endif
   ACPI_STATUS s = AcpiWalkNamespace(ACPI_TYPE_ANY, ACPI_ROOT_OBJECT, UINT32_MAX, walkCb, nullptr, &ctx, nullptr);
-  vlogStatus("AcpiWalkNamespace returned", s);
+  logStatus("AcpiWalkNamespace returned", s);
   if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiWalkNamespace failed");
   if(!ctx.root) throw std::runtime_error("No namespace root built");
-  vlog("Computing subtree hashes");
+  logInfo("Computing subtree hashes");
   computeHashes(ctx.root.get());
   Snapshot snap; snap.root = std::move(ctx.root); snap.by_path = std::move(ctx.by_path);
-  vlog(std::string("Snapshot contains ") + std::to_string(snap.by_path.size()) + " node(s)");
+  logInfo(std::string("Snapshot contains ") + std::to_string(snap.by_path.size()) + " node(s)");
   return snap;
 }
 
@@ -398,9 +470,9 @@ struct DiffItem { enum Kind2{Add,Del,Mod} k; std::string path; Kind nodeKind;
   size_t old_len=0, new_len=0; std::string old_sha, new_sha; };
 
 static void diffSnapshots(const Snapshot &A, const Snapshot &B, std::vector<DiffItem> &out){
-  vlog("Diffing snapshots");
+  logInfo("Diffing snapshots");
   if(A.root->subtree_hash == B.root->subtree_hash){
-    vlog("Snapshots identical; no differences detected");
+    logInfo("Snapshots identical; no differences detected");
     return;
   }
   std::set<std::string> all;
@@ -419,11 +491,11 @@ static void diffSnapshots(const Snapshot &A, const Snapshot &B, std::vector<Diff
       out.push_back(std::move(d));
     }
   }
-  vlog(std::string("Diff identified ") + std::to_string(out.size()-initial) + " change(s)");
+  logInfo(std::string("Diff identified ") + std::to_string(out.size()-initial) + " change(s)");
 }
 
 static void printDiff(const std::vector<DiffItem>& items){
-  vlog(std::string("Printing diff with ") + std::to_string(items.size()) + " change(s)");
+  logInfo(std::string("Printing diff with ") + std::to_string(items.size()) + " change(s)");
   for(const auto &d : items){
     if(d.k==DiffItem::Add){ std::cout<<"+ "<<d.path<<" ("<<kindName(d.nodeKind)<<")\n"; }
     else if(d.k==DiffItem::Del){ std::cout<<"- "<<d.path<<" ("<<kindName(d.nodeKind)<<")\n"; }
@@ -452,14 +524,30 @@ static void printTree(const Node* n, int depth=0){
 // ---------------- CLI ----------------
 
 struct Cli {
-  std::vector<std::string> loadA, loadB; bool do_print=false, do_diff=false; bool verbose=false; };
+  std::vector<std::string> loadA, loadB;
+  bool do_print=false, do_diff=false;
+  LogSeverity verbosity = LogSeverity::Error;
+};
 
 static void usage(const char* argv0){
   std::cerr << "Usage:\n"
-            << "  "<<argv0<<" [--verbose] --load DSDT.aml SSDT*.aml --print\n"
-            << "  "<<argv0<<" [--verbose] --loadA A/DSDT.aml A/SSDT*.aml --loadB B/DSDT.aml B/SSDT*.aml --diff\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] --load DSDT.aml SSDT*.aml --print\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] --loadA A/DSDT.aml A/SSDT*.aml --loadB B/DSDT.aml B/SSDT*.aml --diff\n"
             << "Options:\n"
-            << "  --verbose  Enable detailed logging about ACPICA initialization and table loading\n";
+            << "  --verbosity LEVEL  Set logging verbosity (error, warning, info). Default: error.\n"
+            << "  --verbose         Shorthand for --verbosity info.\n";
+}
+
+static LogSeverity parseVerbosityValue(const std::string &value){
+  std::string lower;
+  lower.reserve(value.size());
+  for(char ch : value){
+    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  if(lower == "error" || lower == "errors") return LogSeverity::Error;
+  if(lower == "warning" || lower == "warnings" || lower == "warn") return LogSeverity::Warning;
+  if(lower == "info" || lower == "information") return LogSeverity::Info;
+  throw std::runtime_error("Invalid verbosity level: " + value);
 }
 
 static Cli parseCli(int argc, char** argv){
@@ -469,7 +557,11 @@ static Cli parseCli(int argc, char** argv){
     else if(a=="--loadB"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } i--; c.loadB=expandGlobs(pats); }
     else if(a=="--print"){ c.do_print=true; }
     else if(a=="--diff"){ c.do_diff=true; }
-    else if(a=="--verbose"){ c.verbose=true; gVerbose=true; vlog("Verbose logging enabled"); }
+    else if(a=="--verbosity"){
+      if(i+1 >= argc) throw std::runtime_error("--verbosity requires an argument");
+      c.verbosity = parseVerbosityValue(argv[++i]);
+    }
+    else if(a=="--verbose"){ c.verbosity = LogSeverity::Info; }
     else { usage(argv[0]); throw std::runtime_error("Unknown arg: "+a); }
   }
   if(!c.do_print && !c.do_diff) throw std::runtime_error("Select --print or --diff");
@@ -482,38 +574,38 @@ int main(int argc, char** argv){
   try{
     auto cli = parseCli(argc, argv);
     if(cli.do_print && cli.do_diff){ usage(argv[0]); return 1; }
-    gVerbose = cli.verbose;
-    if(gVerbose) vlog("Starting acpidiff");
+    gLogThreshold = cli.verbosity;
+    if(isInfoEnabled()) logInfo("Starting acpidiff");
 
     AcpiGuard guard;
 
     if(cli.do_print){
-      vlog("Loading tables for print mode");
+      logInfo("Loading tables for print mode");
       loadTablesFromFiles(cli.loadA);
       auto snap = buildSnapshot();
-      vlog("Printing namespace tree");
+      logInfo("Printing namespace tree");
       printTree(snap.root.get());
       return 0;
     }
 
     if(cli.do_diff){
-      vlog("Loading tables for diff mode (set A)");
+      logInfo("Loading tables for diff mode (set A)");
       loadTablesFromFiles(cli.loadA);
       auto snapA = buildSnapshot();
-      vlog("Terminating ACPICA before loading set B");
+      logInfo("Terminating ACPICA before loading set B");
       AcpiTerminate();
-      vlog("Reinitializing ACPICA for set B");
+      logInfo("Reinitializing ACPICA for set B");
       new (&guard) AcpiGuard();
-      vlog("Loading tables for diff mode (set B)");
+      logInfo("Loading tables for diff mode (set B)");
       loadTablesFromFiles(cli.loadB);
       auto snapB = buildSnapshot();
 
       std::vector<DiffItem> items; items.reserve(128);
       diffSnapshots(snapA, snapB, items);
-      vlog("Printing diff results");
+      logInfo("Printing diff results");
       printDiff(items);
       return 0;
     }
-  } catch(const std::exception &e){ std::cerr<<"error: "<<e.what()<<"\n"; return 1; }
+  } catch(const std::exception &e){ logError(e.what()); return 1; }
   return 0;
 }
