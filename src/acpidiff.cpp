@@ -360,6 +360,7 @@ struct AcpiGuard {
 static void loadTablesFromFiles(const std::vector<std::string>& files){
   gExtraTableDigests.clear();
   logInfo(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
+  bool anyAmlLoaded = false;
   for(const auto &p : files){
     auto buf = readFile(p);
     std::string filename = std::filesystem::path(p).filename().string();
@@ -423,13 +424,18 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
       throw std::runtime_error(oss.str());
     }
     logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
+    anyAmlLoaded = true;
     static std::vector<std::unique_ptr<std::vector<uint8_t>>> gLoadedTableBuffers;
     gLoadedTableBuffers.emplace_back(std::move(storage));
   }
-  logInfo("Committing loaded tables to namespace");
-  ACPI_STATUS s = AcpiLoadTables();
-  logStatus("AcpiLoadTables returned", s);
-  if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
+  if(anyAmlLoaded){
+    logInfo("All AML tables loaded via AcpiLoadTable; skipping AcpiLoadTables bootstrap");
+  } else {
+    logInfo("No AML tables were supplied; invoking AcpiLoadTables to honor firmware defaults");
+    ACPI_STATUS s = AcpiLoadTables();
+    logStatus("AcpiLoadTables returned", s);
+    if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
+  }
 }
 
 // ---------------- Namespace walk and tree build ----------------
