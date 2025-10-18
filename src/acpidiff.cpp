@@ -388,13 +388,16 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           << std::string(hdr->AslCompilerId, hdr->AslCompilerId + sizeof(hdr->AslCompilerId));
       logInfo(oss.str());
     }
+    auto storage = std::make_unique<std::vector<uint8_t>>(std::move(buf));
+    hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(storage->data());
     ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
     if(ACPI_FAILURE(s)){
       std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<formatStatus(s);
       throw std::runtime_error(oss.str());
     }
     logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
-    static std::vector<std::vector<uint8_t>> _keep; _keep.emplace_back(std::move(buf));
+    static std::vector<std::unique_ptr<std::vector<uint8_t>>> gLoadedTableBuffers;
+    gLoadedTableBuffers.emplace_back(std::move(storage));
   }
   logInfo("Committing loaded tables to namespace");
   ACPI_STATUS s = AcpiLoadTables();
