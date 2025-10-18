@@ -140,6 +140,18 @@ static void recordExtraTableDigest(const std::string &signature,
   gExtraTableDigests.push_back(std::move(entry));
 }
 
+static bool tableContainsAml(const ACPI_TABLE_HEADER *hdr){
+  if(!hdr) return false;
+  std::string sig(hdr->Signature, hdr->Signature + ACPI_NAMESEG_SIZE);
+  if(sig == "DSDT" || sig == "SSDT" || sig == "PSDT" || sig == "OSDT"){
+    return true;
+  }
+  if(sig.rfind("OEM", 0) == 0){
+    return true;
+  }
+  return false;
+}
+
 static const char* kindName(Kind k){
   switch(k){
     case Kind::Device: return "Device"; case Kind::Method: return "Method"; case Kind::Name: return "Name";
@@ -387,6 +399,18 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           << " compiler_id="
           << std::string(hdr->AslCompilerId, hdr->AslCompilerId + sizeof(hdr->AslCompilerId));
       logInfo(oss.str());
+    }
+    if(!tableContainsAml(hdr)){
+      if(isInfoEnabled()){
+        std::ostringstream oss;
+        oss << "Recording data-only table signature="
+            << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
+            << " from " << p << " for integrity diff (skipping AcpiLoadTable)";
+        logInfo(oss.str());
+      }
+      recordExtraTableDigest(std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature)),
+                             filename, buf);
+      continue;
     }
     auto storage = std::make_unique<std::vector<uint8_t>>(std::move(buf));
     hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(storage->data());
