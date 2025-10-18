@@ -138,12 +138,20 @@ static Kind mapTypeToKind(ACPI_OBJECT_TYPE t){
 
 // ---------------- Utility ----------------
 
-static bool gVerbose = false;
-
 enum class LogSeverity { Info, Warning, Error };
 
+static LogSeverity gLogThreshold = LogSeverity::Error;
+
+static bool isSeverityEnabled(LogSeverity severity){
+  return static_cast<int>(severity) >= static_cast<int>(gLogThreshold);
+}
+
+static bool isInfoEnabled(){
+  return isSeverityEnabled(LogSeverity::Info);
+}
+
 static void logMessage(LogSeverity severity, const std::string &msg){
-  if(severity == LogSeverity::Info && !gVerbose) return;
+  if(!isSeverityEnabled(severity)) return;
   const char* label = nullptr;
   switch(severity){
     case LogSeverity::Info: label = "info"; break;
@@ -249,7 +257,7 @@ static std::vector<std::string> expandGlobs(const std::vector<std::string>& inpu
     return std::strlen(pa)<std::strlen(pb);
   };
   std::sort(out.begin(), out.end(), natcmp);
-  if(gVerbose){
+  if(isInfoEnabled()){
     std::ostringstream oss;
     oss << "Expanded inputs to " << out.size() << " file(s):";
     for(const auto &p : out) oss << "\n  " << p;
@@ -299,7 +307,7 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           <<" bytes file="<<buf.size();
       logWarn(oss.str());
     }
-    if(gVerbose){
+    if(isInfoEnabled()){
       std::ostringstream oss;
       oss << "Loading table signature="
           << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
@@ -516,14 +524,30 @@ static void printTree(const Node* n, int depth=0){
 // ---------------- CLI ----------------
 
 struct Cli {
-  std::vector<std::string> loadA, loadB; bool do_print=false, do_diff=false; bool verbose=false; };
+  std::vector<std::string> loadA, loadB;
+  bool do_print=false, do_diff=false;
+  LogSeverity verbosity = LogSeverity::Error;
+};
 
 static void usage(const char* argv0){
   std::cerr << "Usage:\n"
-            << "  "<<argv0<<" [--verbose] --load DSDT.aml SSDT*.aml --print\n"
-            << "  "<<argv0<<" [--verbose] --loadA A/DSDT.aml A/SSDT*.aml --loadB B/DSDT.aml B/SSDT*.aml --diff\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] --load DSDT.aml SSDT*.aml --print\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] --loadA A/DSDT.aml A/SSDT*.aml --loadB B/DSDT.aml B/SSDT*.aml --diff\n"
             << "Options:\n"
-            << "  --verbose  Enable detailed logging about ACPICA initialization and table loading\n";
+            << "  --verbosity LEVEL  Set logging verbosity (error, warning, info). Default: error.\n"
+            << "  --verbose         Shorthand for --verbosity info.\n";
+}
+
+static LogSeverity parseVerbosityValue(const std::string &value){
+  std::string lower;
+  lower.reserve(value.size());
+  for(char ch : value){
+    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  if(lower == "error" || lower == "errors") return LogSeverity::Error;
+  if(lower == "warning" || lower == "warnings" || lower == "warn") return LogSeverity::Warning;
+  if(lower == "info" || lower == "information") return LogSeverity::Info;
+  throw std::runtime_error("Invalid verbosity level: " + value);
 }
 
 static Cli parseCli(int argc, char** argv){
@@ -533,7 +557,11 @@ static Cli parseCli(int argc, char** argv){
     else if(a=="--loadB"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } i--; c.loadB=expandGlobs(pats); }
     else if(a=="--print"){ c.do_print=true; }
     else if(a=="--diff"){ c.do_diff=true; }
-    else if(a=="--verbose"){ c.verbose=true; gVerbose=true; logInfo("Verbose logging enabled"); }
+    else if(a=="--verbosity"){
+      if(i+1 >= argc) throw std::runtime_error("--verbosity requires an argument");
+      c.verbosity = parseVerbosityValue(argv[++i]);
+    }
+    else if(a=="--verbose"){ c.verbosity = LogSeverity::Info; }
     else { usage(argv[0]); throw std::runtime_error("Unknown arg: "+a); }
   }
   if(!c.do_print && !c.do_diff) throw std::runtime_error("Select --print or --diff");
@@ -546,8 +574,8 @@ int main(int argc, char** argv){
   try{
     auto cli = parseCli(argc, argv);
     if(cli.do_print && cli.do_diff){ usage(argv[0]); return 1; }
-    gVerbose = cli.verbose;
-    if(gVerbose) logInfo("Starting acpidiff");
+    gLogThreshold = cli.verbosity;
+    if(isInfoEnabled()) logInfo("Starting acpidiff");
 
     AcpiGuard guard;
 
