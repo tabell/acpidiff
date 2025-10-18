@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  add_compile_options(-g)
+elseif(MSVC)
+  add_compile_options(/Zi)
+  add_link_options(/DEBUG)
+endif()
+
 option(USE_ACPICA_INTERNALS "Use ACPICA internal headers for AML and owner mapping" ON)
 
 # Path to vendored ACPICA (git clone https://github.com/acpica/acpica)
