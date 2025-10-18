@@ -29,6 +29,7 @@
 extern "C" {
 #include <acpi.h>
 #include <accommon.h>
+#include <actbl.h>
 }
 
 #ifdef __init
@@ -73,7 +74,7 @@ using tinysha256::sha256;
 
 // ---------------- Data model ----------------
 
-enum class Kind { Device, Method, Name, Region, Field, IndexField, BankField, Scope, Processor, ThermalZone, PowerResource, Mutex, Event, Package, Buffer, Unknown };
+enum class Kind { Device, Method, Name, Region, Field, IndexField, BankField, Scope, Processor, ThermalZone, PowerResource, Mutex, Event, Package, Buffer, TableDigest, Unknown };
 
 struct Node {
   std::string path;     // "\\_SB.PCI0.LPCB.EC0._REG"
@@ -95,13 +96,70 @@ struct Snapshot {
   std::unordered_map<std::string, Node*> by_path; // full path -> Node
 };
 
+struct ExtraTableDigest {
+  std::string signature;
+  std::string source_name;
+  size_t length{0};
+  std::string sha256;
+};
+
+static std::vector<ExtraTableDigest> gExtraTableDigests;
+
+static std::string sanitizeIdentifier(const std::string &input){
+  std::string out;
+  out.reserve(input.size());
+  bool lastUnderscore = false;
+  for(char ch : input){
+    unsigned char c = static_cast<unsigned char>(ch);
+    char out_ch;
+    if(std::isalnum(c)){
+      out_ch = static_cast<char>(std::toupper(c));
+    } else {
+      out_ch = '_';
+    }
+    if(out_ch == '_'){
+      if(lastUnderscore) continue;
+      lastUnderscore = true;
+    } else {
+      lastUnderscore = false;
+    }
+    out.push_back(out_ch);
+  }
+  while(!out.empty() && out.back()=='_') out.pop_back();
+  if(out.empty()) out = "BLOB";
+  return out;
+}
+
+static void recordExtraTableDigest(const std::string &signature,
+                                   const std::string &sourceName,
+                                   const std::vector<uint8_t> &data){
+  ExtraTableDigest entry;
+  entry.signature = signature;
+  entry.source_name = sourceName;
+  entry.length = data.size();
+  entry.sha256 = sha256(data.data(), data.size());
+  gExtraTableDigests.push_back(std::move(entry));
+}
+
+static bool tableContainsAml(const ACPI_TABLE_HEADER *hdr){
+  if(!hdr) return false;
+  if(ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_DSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_SSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_PSDT) ||
+     ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_OSDT) ||
+     ACPI_IS_OEM_SIG(hdr->Signature)){
+    return true;
+  }
+  return false;
+}
+
 static const char* kindName(Kind k){
   switch(k){
     case Kind::Device: return "Device"; case Kind::Method: return "Method"; case Kind::Name: return "Name";
     case Kind::Region: return "Region"; case Kind::Field: return "Field"; case Kind::IndexField: return "IndexField";
     case Kind::BankField: return "BankField"; case Kind::Scope: return "Scope"; case Kind::Processor: return "Processor";
     case Kind::ThermalZone: return "ThermalZone"; case Kind::PowerResource: return "PowerResource"; case Kind::Mutex: return "Mutex";
-    case Kind::Event: return "Event"; case Kind::Package: return "Package"; case Kind::Buffer: return "Buffer"; default: return "Unknown"; }
+    case Kind::Event: return "Event"; case Kind::Package: return "Package"; case Kind::Buffer: return "Buffer"; case Kind::TableDigest: return "TableDigest"; default: return "Unknown"; }
 }
 
 static Kind mapTypeToKind(ACPI_OBJECT_TYPE t){
@@ -223,11 +281,14 @@ static std::vector<uint8_t> readFile(const std::string &path){
   if(!f) throw std::runtime_error("Failed to open file: "+path);
   f.seekg(0, std::ios::end);
   std::streamsize n = f.tellg();
-  if(n < (std::streamsize)sizeof(ACPI_TABLE_HEADER)) throw std::runtime_error("Too small to be an ACPI table: "+path);
+  if(n <= 0) throw std::runtime_error("Empty ACPI blob: "+path);
   f.seekg(0);
   std::vector<uint8_t> buf((size_t)n);
   if(!f.read((char*)buf.data(), n)) throw std::runtime_error("Failed to read: "+path);
   logInfo(std::string("Read ") + std::to_string(buf.size()) + " bytes from " + path);
+  if((size_t)n < sizeof(ACPI_TABLE_HEADER)){
+    logWarn(std::string("Blob smaller than ACPI table header (" ) + std::to_string(buf.size()) + " bytes): " + path);
+  }
   return buf;
 }
 
@@ -297,9 +358,24 @@ struct AcpiGuard {
 };
 
 static void loadTablesFromFiles(const std::vector<std::string>& files){
+  gExtraTableDigests.clear();
   logInfo(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
+  bool anyAmlLoaded = false;
   for(const auto &p : files){
     auto buf = readFile(p);
+    std::string filename = std::filesystem::path(p).filename().string();
+    bool is_rsdp = buf.size() >= 8 && std::memcmp(buf.data(), "RSD PTR ", 8) == 0;
+    bool is_facs = buf.size() >= 4 && std::memcmp(buf.data(), "FACS", 4) == 0;
+    if(is_rsdp || is_facs){
+      const char* label = is_rsdp ? "RSDP" : "FACS";
+      logInfo(std::string("Recording non-AML structure ") + label + " from " + p +
+              " for integrity diff (skipping AcpiLoadTable)");
+      recordExtraTableDigest(label, filename, buf);
+      continue;
+    }
+    if(buf.size() < sizeof(ACPI_TABLE_HEADER)){
+      throw std::runtime_error("Too small to be an ACPI table with header: " + p);
+    }
     auto *hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(buf.data());
     if(hdr->Length != buf.size()){
       std::ostringstream oss;
@@ -307,9 +383,11 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           <<" bytes file="<<buf.size();
       logWarn(oss.str());
     }
+    bool hasAml = tableContainsAml(hdr);
     if(isInfoEnabled()){
       std::ostringstream oss;
-      oss << "Loading table signature="
+      oss << (hasAml ? "Loading" : "Recording non-AML")
+          << " table signature="
           << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
           << " oem_id="
           << std::string(hdr->OemId, hdr->OemId + sizeof(hdr->OemId))
@@ -326,18 +404,38 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
           << std::string(hdr->AslCompilerId, hdr->AslCompilerId + sizeof(hdr->AslCompilerId));
       logInfo(oss.str());
     }
+    if(!hasAml){
+      if(isInfoEnabled()){
+        std::ostringstream oss;
+        oss << "Recording data-only table signature="
+            << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
+            << " from " << p << " for integrity diff (skipping AcpiLoadTable)";
+        logInfo(oss.str());
+      }
+      recordExtraTableDigest(std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature)),
+                             filename, buf);
+      continue;
+    }
+    auto storage = std::make_unique<std::vector<uint8_t>>(std::move(buf));
+    hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(storage->data());
     ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
     if(ACPI_FAILURE(s)){
       std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<formatStatus(s);
       throw std::runtime_error(oss.str());
     }
     logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
-    static std::vector<std::vector<uint8_t>> _keep; _keep.emplace_back(std::move(buf));
+    anyAmlLoaded = true;
+    static std::vector<std::unique_ptr<std::vector<uint8_t>>> gLoadedTableBuffers;
+    gLoadedTableBuffers.emplace_back(std::move(storage));
   }
-  logInfo("Committing loaded tables to namespace");
-  ACPI_STATUS s = AcpiLoadTables();
-  logStatus("AcpiLoadTables returned", s);
-  if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
+  if(anyAmlLoaded){
+    logInfo("All AML tables loaded via AcpiLoadTable; skipping AcpiLoadTables bootstrap");
+  } else {
+    logInfo("No AML tables were supplied; invoking AcpiLoadTables to honor firmware defaults");
+    ACPI_STATUS s = AcpiLoadTables();
+    logStatus("AcpiLoadTables returned", s);
+    if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
+  }
 }
 
 // ---------------- Namespace walk and tree build ----------------
@@ -352,6 +450,36 @@ struct BuildCtx {
   std::unordered_map<UINT16, std::string> owner_to_table;
 #endif
 };
+
+static void injectExtraTableDigests(BuildCtx &ctx){
+  if(!ctx.root) return;
+  if(gExtraTableDigests.empty()) return;
+  logInfo(std::string("Injecting ") + std::to_string(gExtraTableDigests.size()) +
+          " non-AML table digest node(s)");
+  for(const auto &extra : gExtraTableDigests){
+    std::string label = sanitizeIdentifier(extra.signature);
+    std::string base = "\\\\__TABLEDIGEST." + label;
+    if(!extra.source_name.empty()){
+      std::string source = sanitizeIdentifier(extra.source_name);
+      if(!source.empty()) base += '.' + source;
+    }
+    std::string path = base;
+    int counter = 1;
+    while(ctx.by_path.find(path) != ctx.by_path.end()){
+      path = base + '_' + std::to_string(counter++);
+    }
+    auto node = std::make_unique<Node>();
+    node->path = path;
+    node->kind = Kind::TableDigest;
+    node->table_id = extra.signature.empty() ? label : extra.signature;
+    node->attrs.aml_len = extra.length;
+    node->attrs.aml_sha256 = extra.sha256;
+    Node* raw = node.get();
+    ctx.root->children.emplace_back(std::move(node));
+    ctx.by_path[raw->path] = raw;
+  }
+  gExtraTableDigests.clear();
+}
 
 #ifdef USE_ACPICA_INTERNALS
 static std::string tableTagFromDesc(ACPI_TABLE_DESC* d, size_t ssdt_index){
@@ -457,6 +585,7 @@ static Snapshot buildSnapshot(){
   logStatus("AcpiWalkNamespace returned", s);
   if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiWalkNamespace failed");
   if(!ctx.root) throw std::runtime_error("No namespace root built");
+  injectExtraTableDigests(ctx);
   logInfo("Computing subtree hashes");
   computeHashes(ctx.root.get());
   Snapshot snap; snap.root = std::move(ctx.root); snap.by_path = std::move(ctx.by_path);
