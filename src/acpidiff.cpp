@@ -16,6 +16,7 @@
 #include <glob.h>
 #include <iostream>
 #include <iomanip>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -296,43 +297,245 @@ struct AcpiGuard {
   }
 };
 
-static void loadTablesFromFiles(const std::vector<std::string>& files){
-  logInfo(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
-  for(const auto &p : files){
-    auto buf = readFile(p);
-    auto *hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(buf.data());
-    if(hdr->Length != buf.size()){
+struct TableBuffer {
+  std::string source;
+  std::string signature;
+  std::vector<uint8_t> data;
+};
+
+static std::string headerSignature(const ACPI_TABLE_HEADER &hdr){
+  return std::string(hdr.Signature, hdr.Signature + sizeof(hdr.Signature));
+}
+
+static uint8_t parseHexPair(char hi, char lo){
+  auto hexVal=[](char ch)->int{
+    if(ch>='0'&&ch<='9') return ch-'0';
+    if(ch>='a'&&ch<='f') return 10+ch-'a';
+    if(ch>='A'&&ch<='F') return 10+ch-'A';
+    return -1;
+  };
+  int v1 = hexVal(hi);
+  int v2 = hexVal(lo);
+  if(v1<0 || v2<0) throw std::runtime_error("Invalid hex digit in acpidump");
+  return static_cast<uint8_t>((v1<<4)|v2);
+}
+
+static std::vector<TableBuffer> parseAcpidump(const std::string &path){
+  logInfo(std::string("Parsing acpidump file ") + path);
+  std::ifstream f(path);
+  if(!f) throw std::runtime_error("Failed to open acpidump file: "+path);
+  std::string line;
+  std::string currentSignature;
+  std::optional<size_t> expectedLength;
+  bool inRaw=false;
+  std::vector<uint8_t> raw;
+  std::vector<TableBuffer> tables;
+  size_t tableIndex=0;
+  auto finalize=[&](){
+    if(raw.empty()) return;
+    if(expectedLength && raw.size()!=*expectedLength){
       std::ostringstream oss;
-      oss << "table length mismatch for "<<p<<" hdr="<<hdr->Length
-          <<" bytes file="<<buf.size();
+      oss << "acpidump length mismatch for signature="
+          << (currentSignature.empty()?"UNKNOWN":currentSignature)
+          << " expected=" << *expectedLength
+          << " actual=" << raw.size();
+      logWarn(oss.str());
+    }
+    TableBuffer tb;
+    tb.signature = currentSignature;
+    std::ostringstream src;
+    src << path << "#" << (currentSignature.empty()?"UNKNOWN":currentSignature)
+        << "[" << tableIndex++ << "]";
+    tb.source = src.str();
+    tb.data = std::move(raw);
+    tables.emplace_back(std::move(tb));
+    raw.clear();
+    expectedLength.reset();
+    currentSignature.clear();
+    inRaw=false;
+  };
+  while(std::getline(f,line)){
+    if(inRaw){
+      if(line.empty()){
+        finalize();
+        continue;
+      }
+      auto colon = line.find(':');
+      if(colon==std::string::npos){
+        finalize();
+        continue;
+      }
+      for(size_t i=colon+1;i<line.size();){
+        if(line[i]=='|') break;
+        while(i<line.size() && !std::isxdigit(static_cast<unsigned char>(line[i]))){
+          if(line[i]=='|') { i=line.size(); break; }
+          ++i;
+        }
+        if(i>=line.size()||line[i]=='|') break;
+        if(i+1>=line.size() || !std::isxdigit(static_cast<unsigned char>(line[i+1]))){
+          break;
+        }
+        raw.push_back(parseHexPair(line[i], line[i+1]));
+        i+=2;
+      }
+      if(expectedLength && raw.size()>=*expectedLength){
+        finalize();
+      }
+      continue;
+    }
+    auto sigPos = line.find("Signature");
+    if(sigPos!=std::string::npos){
+      auto q1 = line.find('"', sigPos);
+      if(q1!=std::string::npos){
+        auto q2 = line.find('"', q1+1);
+        if(q2!=std::string::npos){
+          currentSignature = line.substr(q1+1, q2-q1-1);
+        }
+      }
+    }
+    auto lenPos = line.find("Table Length");
+    if(lenPos==std::string::npos) lenPos = line.find("Length");
+    if(lenPos!=std::string::npos && line.find("Raw Table Data")==std::string::npos){
+      auto colon = line.find(':', lenPos);
+      if(colon!=std::string::npos){
+        size_t j=colon+1;
+        while(j<line.size() && std::isspace(static_cast<unsigned char>(line[j]))) j++;
+        size_t k=j;
+        while(k<line.size() && std::isxdigit(static_cast<unsigned char>(line[k]))) k++;
+        if(k>j){
+          try{
+            expectedLength = std::stoul(line.substr(j, k-j), nullptr, 16);
+          } catch(...){
+            logWarn(std::string("Failed to parse length in acpidump line: ")+line);
+          }
+        }
+      }
+    }
+    if(line.find("Raw Table Data")!=std::string::npos){
+      inRaw=true;
+      raw.clear();
+    }
+  }
+  if(inRaw) finalize();
+  if(isInfoEnabled()){
+    std::ostringstream oss;
+    oss << "Extracted " << tables.size() << " table(s) from acpidump";
+    for(const auto &tb : tables){
+      oss << "\n  " << tb.source << " size=" << tb.data.size();
+      if(!tb.signature.empty()) oss << " signature=" << tb.signature;
+    }
+    logInfo(oss.str());
+  }
+  return tables;
+}
+
+static std::vector<TableBuffer> collectTablesFromFiles(const std::vector<std::string>& files){
+  std::vector<TableBuffer> out;
+  out.reserve(files.size());
+  for(const auto &p : files){
+    TableBuffer tb;
+    tb.source = p;
+    tb.data = readFile(p);
+    if(tb.data.size() >= sizeof(ACPI_TABLE_HEADER)){
+      ACPI_TABLE_HEADER hdrCopy;
+      std::memcpy(&hdrCopy, tb.data.data(), sizeof(ACPI_TABLE_HEADER));
+      tb.signature = headerSignature(hdrCopy);
+    }
+    out.emplace_back(std::move(tb));
+  }
+  return out;
+}
+
+static std::vector<TableBuffer> collectTablesFromDumps(const std::vector<std::string>& dumps){
+  std::vector<TableBuffer> out;
+  for(const auto &p : dumps){
+    auto extracted = parseAcpidump(p);
+    out.reserve(out.size() + extracted.size());
+    std::move(extracted.begin(), extracted.end(), std::back_inserter(out));
+  }
+  return out;
+}
+
+struct InputSet {
+  std::vector<std::string> files;
+  std::vector<std::string> dumps;
+};
+
+static std::vector<TableBuffer> collectTables(const InputSet &inputs){
+  std::vector<TableBuffer> out;
+  auto fromFiles = collectTablesFromFiles(inputs.files);
+  auto fromDumps = collectTablesFromDumps(inputs.dumps);
+  out.reserve(fromFiles.size() + fromDumps.size());
+  std::move(fromFiles.begin(), fromFiles.end(), std::back_inserter(out));
+  std::move(fromDumps.begin(), fromDumps.end(), std::back_inserter(out));
+  return out;
+}
+
+static void loadTablesFromBuffers(std::vector<TableBuffer> tables);
+
+static void loadTablesForInput(const InputSet &inputs){
+  auto tables = collectTables(inputs);
+  if(tables.empty()){
+    throw std::runtime_error("No ACPI tables were provided");
+  }
+  loadTablesFromBuffers(std::move(tables));
+}
+
+static void loadTablesFromBuffers(std::vector<TableBuffer> tables){
+  logInfo(std::string("Preparing to load ") + std::to_string(tables.size()) + " table buffer(s)");
+  static std::vector<std::vector<uint8_t>> keep;
+  for(auto &tb : tables){
+    std::string signature = tb.signature;
+    if(tb.data.size() < sizeof(ACPI_TABLE_HEADER)){
+      std::ostringstream oss;
+      oss << "Skipping table " << tb.source << " (" << (signature.empty()?"UNKNOWN":signature)
+          << ") too small for ACPI header";
+      logWarn(oss.str());
+      continue;
+    }
+    ACPI_TABLE_HEADER hdrCopy{};
+    std::memcpy(&hdrCopy, tb.data.data(), sizeof(ACPI_TABLE_HEADER));
+    if(signature.empty()) signature = headerSignature(hdrCopy);
+    if(signature == "FACS" || signature == "RSD PTR "){
+      std::ostringstream oss;
+      oss << "Skipping non-loadable table " << tb.source << " signature=" << signature;
+      logWarn(oss.str());
+      continue;
+    }
+    if(hdrCopy.Length != tb.data.size()){
+      std::ostringstream oss;
+      oss << "table length mismatch for "<<tb.source<<" hdr="<<hdrCopy.Length
+          <<" bytes buffer="<<tb.data.size();
       logWarn(oss.str());
     }
     if(isInfoEnabled()){
       std::ostringstream oss;
       oss << "Loading table signature="
-          << std::string(hdr->Signature, hdr->Signature + sizeof(hdr->Signature))
+          << headerSignature(hdrCopy)
           << " oem_id="
-          << std::string(hdr->OemId, hdr->OemId + sizeof(hdr->OemId))
+          << std::string(hdrCopy.OemId, hdrCopy.OemId + sizeof(hdrCopy.OemId))
           << " table_id="
-          << std::string(hdr->OemTableId, hdr->OemTableId + sizeof(hdr->OemTableId))
-          << " length=" << hdr->Length
-          << " checksum=" << static_cast<int>(hdr->Checksum)
-          << " revision=" << static_cast<int>(hdr->Revision);
+          << std::string(hdrCopy.OemTableId, hdrCopy.OemTableId + sizeof(hdrCopy.OemTableId))
+          << " length=" << hdrCopy.Length
+          << " checksum=" << static_cast<int>(hdrCopy.Checksum)
+          << " revision=" << static_cast<int>(hdrCopy.Revision);
       oss << std::hex << std::showbase
-          << " oem_revision=" << hdr->OemRevision
-          << " compiler_rev=" << hdr->AslCompilerRevision
+          << " oem_revision=" << hdrCopy.OemRevision
+          << " compiler_rev=" << hdrCopy.AslCompilerRevision
           << std::dec << std::noshowbase
           << " compiler_id="
-          << std::string(hdr->AslCompilerId, hdr->AslCompilerId + sizeof(hdr->AslCompilerId));
+          << std::string(hdrCopy.AslCompilerId, hdrCopy.AslCompilerId + sizeof(hdrCopy.AslCompilerId))
+          << " source=" << tb.source;
       logInfo(oss.str());
     }
+    keep.emplace_back(std::move(tb.data));
+    ACPI_TABLE_HEADER* hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(keep.back().data());
     ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
     if(ACPI_FAILURE(s)){
-      std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<formatStatus(s);
+      std::ostringstream oss; oss << "AcpiLoadTable failed for "<<tb.source<<" status="<<formatStatus(s);
       throw std::runtime_error(oss.str());
     }
-    logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
-    static std::vector<std::vector<uint8_t>> _keep; _keep.emplace_back(std::move(buf));
+    logStatus(std::string("AcpiLoadTable succeeded for ") + tb.source, s);
   }
   logInfo("Committing loaded tables to namespace");
   ACPI_STATUS s = AcpiLoadTables();
@@ -524,18 +727,35 @@ static void printTree(const Node* n, int depth=0){
 // ---------------- CLI ----------------
 
 struct Cli {
-  std::vector<std::string> loadA, loadB;
+  InputSet setA;
+  InputSet setB;
   bool do_print=false, do_diff=false;
   LogSeverity verbosity = LogSeverity::Error;
 };
 
+static void appendFileInputs(InputSet &set, std::vector<std::string> files, const std::string &flagName){
+  if(!set.dumps.empty()){
+    throw std::runtime_error(flagName + " cannot be combined with acpidump inputs for the same dataset");
+  }
+  set.files.reserve(set.files.size() + files.size());
+  std::move(files.begin(), files.end(), std::back_inserter(set.files));
+}
+
+static void appendDumpInput(InputSet &set, const std::string &path, const std::string &flagName){
+  if(!set.files.empty()){
+    throw std::runtime_error(flagName + " cannot be combined with raw table inputs for the same dataset");
+  }
+  set.dumps.push_back(path);
+}
+
 static void usage(const char* argv0){
   std::cerr << "Usage:\n"
-            << "  "<<argv0<<" [--verbosity LEVEL] --load DSDT.aml SSDT*.aml --print\n"
-            << "  "<<argv0<<" [--verbosity LEVEL] --loadA A/DSDT.aml A/SSDT*.aml --loadB B/DSDT.aml B/SSDT*.aml --diff\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] (--load TABLES... | --acpidump dump.txt) --print\n"
+            << "  "<<argv0<<" [--verbosity LEVEL] ((--loadA TABLES... | --acpidumpA dump.txt) (--loadB TABLES... | --acpidumpB dump.txt)) --diff\n"
             << "Options:\n"
             << "  --verbosity LEVEL  Set logging verbosity (error, warning, info). Default: error.\n"
-            << "  --verbose         Shorthand for --verbosity info.\n";
+            << "  --verbose         Shorthand for --verbosity info.\n"
+            << "  --acpidump*       Extract tables from acpidump output instead of raw AML files.\n";
 }
 
 static LogSeverity parseVerbosityValue(const std::string &value){
@@ -553,8 +773,10 @@ static LogSeverity parseVerbosityValue(const std::string &value){
 static Cli parseCli(int argc, char** argv){
   Cli c; for(int i=1;i<argc;i++){
     std::string a=argv[i];
-    if(a=="--load"||a=="--loadA"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } i--; auto files=expandGlobs(pats); c.loadA=files; }
-    else if(a=="--loadB"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } i--; c.loadB=expandGlobs(pats); }
+    if(a=="--load"||a=="--loadA"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } if(pats.empty()) throw std::runtime_error(a+" requires at least one path"); i--; auto files=expandGlobs(pats); appendFileInputs(c.setA, std::move(files), a); }
+    else if(a=="--loadB"){ std::vector<std::string> pats; for(i=i+1;i<argc && argv[i][0]!='-'; i++){ pats.emplace_back(argv[i]); } if(pats.empty()) throw std::runtime_error("--loadB requires at least one path"); i--; appendFileInputs(c.setB, expandGlobs(pats), a); }
+    else if(a=="--acpidump"||a=="--acpidumpA"){ if(i+1>=argc) throw std::runtime_error(a+" requires a file argument"); appendDumpInput(c.setA, argv[++i], a); }
+    else if(a=="--acpidumpB"){ if(i+1>=argc) throw std::runtime_error("--acpidumpB requires a file argument"); appendDumpInput(c.setB, argv[++i], a); }
     else if(a=="--print"){ c.do_print=true; }
     else if(a=="--diff"){ c.do_diff=true; }
     else if(a=="--verbosity"){
@@ -565,8 +787,9 @@ static Cli parseCli(int argc, char** argv){
     else { usage(argv[0]); throw std::runtime_error("Unknown arg: "+a); }
   }
   if(!c.do_print && !c.do_diff) throw std::runtime_error("Select --print or --diff");
-  if(c.do_print && c.loadA.empty()) throw std::runtime_error("--print requires --load");
-  if(c.do_diff && (c.loadA.empty()||c.loadB.empty())) throw std::runtime_error("--diff requires --loadA and --loadB");
+  auto hasInputs=[](const InputSet &set){ return !set.files.empty() || !set.dumps.empty(); };
+  if(c.do_print && !hasInputs(c.setA)) throw std::runtime_error("--print requires input tables via --load/--acpidump");
+  if(c.do_diff && (!hasInputs(c.setA) || !hasInputs(c.setB))) throw std::runtime_error("--diff requires inputs for both sets");
   return c;
 }
 
@@ -581,7 +804,7 @@ int main(int argc, char** argv){
 
     if(cli.do_print){
       logInfo("Loading tables for print mode");
-      loadTablesFromFiles(cli.loadA);
+      loadTablesForInput(cli.setA);
       auto snap = buildSnapshot();
       logInfo("Printing namespace tree");
       printTree(snap.root.get());
@@ -590,14 +813,14 @@ int main(int argc, char** argv){
 
     if(cli.do_diff){
       logInfo("Loading tables for diff mode (set A)");
-      loadTablesFromFiles(cli.loadA);
+      loadTablesForInput(cli.setA);
       auto snapA = buildSnapshot();
       logInfo("Terminating ACPICA before loading set B");
       AcpiTerminate();
       logInfo("Reinitializing ACPICA for set B");
       new (&guard) AcpiGuard();
       logInfo("Loading tables for diff mode (set B)");
-      loadTablesFromFiles(cli.loadB);
+      loadTablesForInput(cli.setB);
       auto snapB = buildSnapshot();
 
       std::vector<DiffItem> items; items.reserve(128);
