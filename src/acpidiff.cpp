@@ -357,10 +357,78 @@ struct AcpiGuard {
   }
 };
 
+static bool hydrateDsdtGlobals(const ACPI_TABLE_HEADER *expectedHeader,
+                               UINT32 reportedIndex){
+  if(!expectedHeader){
+    logError("Cannot hydrate DSDT globals: null header pointer");
+    return false;
+  }
+  if(!AcpiGbl_RootTableList.Tables || AcpiGbl_RootTableList.CurrentTableCount == 0){
+    logError("Cannot hydrate DSDT globals: ACPICA root table list is empty");
+    return false;
+  }
+
+  auto isDsdtSignature = [](const ACPI_TABLE_DESC &desc){
+    return ACPI_COMPARE_NAMESEG(desc.Signature.Ascii, ACPI_SIG_DSDT);
+  };
+
+  ACPI_TABLE_DESC *match = nullptr;
+  UINT32 matchIndex = ACPI_INVALID_TABLE_INDEX;
+  if(reportedIndex != ACPI_INVALID_TABLE_INDEX &&
+     reportedIndex < AcpiGbl_RootTableList.CurrentTableCount){
+    ACPI_TABLE_DESC &candidate = AcpiGbl_RootTableList.Tables[reportedIndex];
+    if(isDsdtSignature(candidate)){
+      match = &candidate;
+      matchIndex = reportedIndex;
+    }
+  }
+
+  for(UINT32 i = 0; !match && i < AcpiGbl_RootTableList.CurrentTableCount; ++i){
+    ACPI_TABLE_DESC &candidate = AcpiGbl_RootTableList.Tables[i];
+    if(!isDsdtSignature(candidate)) continue;
+    match = &candidate;
+    matchIndex = i;
+    if(candidate.Pointer == expectedHeader) break;
+  }
+
+  if(!match || !match->Pointer){
+    logError("Unable to locate loaded DSDT within ACPICA root table list");
+    return false;
+  }
+
+  if(match->Pointer != expectedHeader){
+    std::ostringstream oss;
+    oss << "DSDT descriptor pointer " << static_cast<const void*>(match->Pointer)
+        << " differs from supplied buffer " << static_cast<const void*>(expectedHeader)
+        << "; using descriptor pointer";
+    logWarn(oss.str());
+  }
+
+  if(AcpiGbl_DSDT == match->Pointer && AcpiGbl_DsdtIndex == matchIndex){
+    logInfo("DSDT globals already hydrated; leaving existing values in place");
+    return true;
+  }
+
+  AcpiGbl_DsdtIndex = matchIndex;
+  AcpiGbl_DSDT = match->Pointer;
+  std::memcpy(&AcpiGbl_OriginalDsdtHeader, AcpiGbl_DSDT, sizeof(ACPI_TABLE_HEADER));
+
+  std::string sig(match->Signature.Ascii,
+                  match->Signature.Ascii + sizeof(match->Signature.Ascii));
+  std::ostringstream oss;
+  oss << "Hydrated DSDT globals from table index " << matchIndex
+      << " (signature=" << sig << ")";
+  logInfo(oss.str());
+  return true;
+}
+
 static void loadTablesFromFiles(const std::vector<std::string>& files){
   gExtraTableDigests.clear();
   logInfo(std::string("Preparing to load ") + std::to_string(files.size()) + " table file(s)");
   bool anyAmlLoaded = false;
+  bool dsdtProvided = false;
+  const ACPI_TABLE_HEADER *dsdtHeader = nullptr;
+  UINT32 dsdtTableIndex = ACPI_INVALID_TABLE_INDEX;
   for(const auto &p : files){
     auto buf = readFile(p);
     std::string filename = std::filesystem::path(p).filename().string();
@@ -418,18 +486,37 @@ static void loadTablesFromFiles(const std::vector<std::string>& files){
     }
     auto storage = std::make_unique<std::vector<uint8_t>>(std::move(buf));
     hdr = reinterpret_cast<ACPI_TABLE_HEADER*>(storage->data());
-    ACPI_STATUS s = AcpiLoadTable(hdr, nullptr);
+    UINT32 tableIndex = ACPI_INVALID_TABLE_INDEX;
+    ACPI_STATUS s = AcpiLoadTable(hdr, &tableIndex);
     if(ACPI_FAILURE(s)){
       std::ostringstream oss; oss << "AcpiLoadTable failed for "<<p<<" status="<<formatStatus(s);
       throw std::runtime_error(oss.str());
     }
     logStatus(std::string("AcpiLoadTable succeeded for ") + p, s);
     anyAmlLoaded = true;
+    if(ACPI_COMPARE_NAMESEG(hdr->Signature, ACPI_SIG_DSDT)){
+      dsdtProvided = true;
+      dsdtHeader = hdr;
+      dsdtTableIndex = tableIndex;
+    }
     static std::vector<std::unique_ptr<std::vector<uint8_t>>> gLoadedTableBuffers;
     gLoadedTableBuffers.emplace_back(std::move(storage));
   }
   if(anyAmlLoaded){
-    logInfo("All AML tables loaded via AcpiLoadTable; skipping AcpiLoadTables bootstrap");
+    bool hydrated = false;
+    if(dsdtProvided){
+      hydrated = hydrateDsdtGlobals(dsdtHeader, dsdtTableIndex);
+    } else {
+      logError("AML payload(s) were provided but no DSDT was supplied; cannot hydrate ACPICA globals");
+    }
+    if(hydrated){
+      logInfo("Manual AML load completed; skipping AcpiLoadTables bootstrap");
+    } else {
+      logInfo("Falling back to AcpiLoadTables bootstrap to populate ACPICA globals");
+      ACPI_STATUS s = AcpiLoadTables();
+      logStatus("AcpiLoadTables returned", s);
+      if(ACPI_FAILURE(s)) throw std::runtime_error("AcpiLoadTables failed");
+    }
   } else {
     logInfo("No AML tables were supplied; invoking AcpiLoadTables to honor firmware defaults");
     ACPI_STATUS s = AcpiLoadTables();
