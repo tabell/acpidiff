@@ -682,8 +682,17 @@ static Snapshot buildSnapshot(){
 
 // ---------------- Diff ----------------
 
-struct DiffItem { enum Kind2{Add,Del,Mod} k; std::string path; Kind nodeKind;
-  size_t old_len=0, new_len=0; std::string old_sha, new_sha; };
+struct DiffItem {
+  enum Kind2 { Add, Del, Mod } k;
+  std::string path;
+  Kind nodeKind;
+  std::string old_table_id;
+  std::string new_table_id;
+  size_t old_len = 0;
+  size_t new_len = 0;
+  std::string old_sha;
+  std::string new_sha;
+};
 
 static void diffSnapshots(const Snapshot &A, const Snapshot &B, std::vector<DiffItem> &out){
   logInfo("Diffing snapshots");
@@ -697,21 +706,152 @@ static void diffSnapshots(const Snapshot &A, const Snapshot &B, std::vector<Diff
   size_t initial = out.size();
   for(const auto &p : all){
     auto ia = A.by_path.find(p), ib = B.by_path.find(p);
-    if(ia==A.by_path.end()){ out.push_back({DiffItem::Add, p, ib->second->kind}); continue; }
-    if(ib==B.by_path.end()){ out.push_back({DiffItem::Del, p, ia->second->kind}); continue; }
+    if(ia==A.by_path.end()){
+      DiffItem d;
+      d.k = DiffItem::Add;
+      d.path = p;
+      d.nodeKind = ib->second->kind;
+      d.new_table_id = ib->second->table_id;
+      if(d.nodeKind == Kind::Method){
+        d.new_len = ib->second->attrs.aml_len;
+        d.new_sha = ib->second->attrs.aml_sha256;
+      }
+      out.push_back(std::move(d));
+      continue;
+    }
+    if(ib==B.by_path.end()){
+      DiffItem d;
+      d.k = DiffItem::Del;
+      d.path = p;
+      d.nodeKind = ia->second->kind;
+      d.old_table_id = ia->second->table_id;
+      if(d.nodeKind == Kind::Method){
+        d.old_len = ia->second->attrs.aml_len;
+        d.old_sha = ia->second->attrs.aml_sha256;
+      }
+      out.push_back(std::move(d));
+      continue;
+    }
     Node* na = ia->second; Node* nb = ib->second;
     if(na->subtree_hash == nb->subtree_hash) continue;
     if(na->node_hash != nb->node_hash){
-      DiffItem d; d.k=DiffItem::Mod; d.path=p; d.nodeKind=nb->kind;
-      if(nb->kind==Kind::Method){ d.old_len=na->attrs.aml_len; d.new_len=nb->attrs.aml_len; d.old_sha=na->attrs.aml_sha256; d.new_sha=nb->attrs.aml_sha256; }
+      DiffItem d;
+      d.k = DiffItem::Mod;
+      d.path = p;
+      d.nodeKind = nb->kind;
+      d.old_table_id = na->table_id;
+      d.new_table_id = nb->table_id;
+      if(nb->kind==Kind::Method){
+        d.old_len=na->attrs.aml_len;
+        d.new_len=nb->attrs.aml_len;
+        d.old_sha=na->attrs.aml_sha256;
+        d.new_sha=nb->attrs.aml_sha256;
+      }
       out.push_back(std::move(d));
     }
   }
   logInfo(std::string("Diff identified ") + std::to_string(out.size()-initial) + " change(s)");
 }
 
+static void printDiffSummary(const std::vector<DiffItem>& items){
+  if(items.empty()){
+    std::cout << "Summary: no differences detected.\n";
+    return;
+  }
+
+  struct Summary {
+    int adds = 0;
+    int dels = 0;
+    int mods = 0;
+    int method_adds = 0;
+    int method_dels = 0;
+    int method_mods = 0;
+    long long method_len_delta = 0;
+  };
+
+  std::map<std::string, Summary> per_table;
+  Summary total;
+
+  auto tableFor = [](const DiffItem &d) -> std::string {
+    if(!d.new_table_id.empty()) return d.new_table_id;
+    if(!d.old_table_id.empty()) return d.old_table_id;
+    return std::string("UNKNOWN");
+  };
+
+  auto updateSummary = [&](Summary &entry, const DiffItem &d){
+    switch(d.k){
+      case DiffItem::Add:
+        entry.adds++;
+        if(d.nodeKind == Kind::Method){
+          entry.method_adds++;
+          entry.method_len_delta += static_cast<long long>(d.new_len);
+        }
+        break;
+      case DiffItem::Del:
+        entry.dels++;
+        if(d.nodeKind == Kind::Method){
+          entry.method_dels++;
+          entry.method_len_delta -= static_cast<long long>(d.old_len);
+        }
+        break;
+      case DiffItem::Mod:
+        entry.mods++;
+        if(d.nodeKind == Kind::Method){
+          entry.method_mods++;
+          entry.method_len_delta += static_cast<long long>(d.new_len) - static_cast<long long>(d.old_len);
+        }
+        break;
+    }
+  };
+
+  for(const auto &d : items){
+    auto table = tableFor(d);
+    Summary &entry = per_table[table];
+    updateSummary(entry, d);
+    updateSummary(total, d);
+  }
+
+  std::cout << "Summary of differences by table:\n";
+  for(const auto &kv : per_table){
+    const auto &table = kv.first;
+    const auto &entry = kv.second;
+    std::cout << "  " << table << ": +" << entry.adds << " -" << entry.dels << " ~" << entry.mods;
+    bool has_method_counts = entry.method_adds || entry.method_dels || entry.method_mods;
+    bool has_method_delta = entry.method_len_delta != 0;
+    if(has_method_counts || has_method_delta){
+      std::cout << " (methods +" << entry.method_adds
+                << " -" << entry.method_dels
+                << " ~" << entry.method_mods;
+      if(has_method_delta){
+        std::cout << ", Δaml_len=";
+        if(entry.method_len_delta > 0) std::cout << '+';
+        std::cout << entry.method_len_delta << " B";
+      }
+      std::cout << ')';
+    }
+    std::cout << "\n";
+  }
+
+  std::cout << "  Total: +" << total.adds << " -" << total.dels << " ~" << total.mods;
+  bool total_has_counts = total.method_adds || total.method_dels || total.method_mods;
+  bool total_has_delta = total.method_len_delta != 0;
+  if(total_has_counts || total_has_delta){
+    std::cout << " (methods +" << total.method_adds
+              << " -" << total.method_dels
+              << " ~" << total.method_mods;
+    if(total_has_delta){
+      std::cout << ", Δaml_len=";
+      if(total.method_len_delta > 0) std::cout << '+';
+      std::cout << total.method_len_delta << " B";
+    }
+    std::cout << ')';
+  }
+  std::cout << "\n";
+}
+
 static void printDiff(const std::vector<DiffItem>& items){
   logInfo(std::string("Printing diff with ") + std::to_string(items.size()) + " change(s)");
+  printDiffSummary(items);
   for(const auto &d : items){
     if(d.k==DiffItem::Add){ std::cout<<"+ "<<d.path<<" ("<<kindName(d.nodeKind)<<")\n"; }
     else if(d.k==DiffItem::Del){ std::cout<<"- "<<d.path<<" ("<<kindName(d.nodeKind)<<")\n"; }
